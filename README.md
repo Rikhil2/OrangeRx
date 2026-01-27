@@ -2,17 +2,10 @@
 OrangeRx is a simulation framework designed to model tumor dynamics and predict optimal drug regimens based on the ploidy composition of cell populations. It utilizes a Monte Carlo Tree Search (MCTS) algorithm to identify the most effective treatment sequences over multiple cycles.
 
 Prerequisites
-To run this simulation, ensure you have both R and Python installed. The application relies on the following packages:
-
-R Requirements
+To run this simulation, ensure you have R installed. The application relies on the following packages:
 - shiny
 - deSolve
 - reticulate
-
-Python Requirements
-- numpy
-- scipy
-- matplotlib
 
 Getting Started
 Run the Code: Open your R environment and run the script titled mcts_shiny_app.R.
