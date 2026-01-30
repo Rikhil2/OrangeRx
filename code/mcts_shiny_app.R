@@ -1,6 +1,8 @@
 library(shiny)
 library(deSolve)
 
+eps <- 1e-6
+
 drug_dosing_schedules <- list(
     "volasertib"    = "IV",
     "umi-77"        = "IV",
@@ -41,6 +43,7 @@ PER_DRUG <- list(
     "umi-77"       = list(C_peak = 1.0, half_life = 0.8, period = 7.0),
     "navitoclax"   = list(C_peak = 1.0, half_life = 0.73, period = 1),
     "bay1895344"   = list(C_peak = 6.2, half_life = 0.50, period = 0.5),
+    "none"         = list(C_peak = 0, half_life = 0.50, period = 7),
     "Topotecan"    = list(C_peak = unknown_value, half_life = unknown_value, period = unknown_value),
     "Doxorubicin"  = list(C_peak = unknown_value, half_life = unknown_value, period = unknown_value),
 
@@ -204,9 +207,337 @@ get_concentration_curve <- function(drug_name, ...) {
     }
 }
 
+# Simulate SDE using Exponential Euler
+simulate_sde <- function(ploidy_status, drug, T_span, dt=0.1, r=0.4, K=6e10, n_sims=1000, beta_by_ploidy=NULL) {
+    ploidies <- sort(as.numeric(names(ploidy_status)))
+    T0 <- as.numeric(ploidy_status[as.character(ploidies)])
+    M <- length(ploidies)
+
+    # Get PD parameters for each ploidy
+    phi_params <- lapply(ploidies, function(p) f_pd_params(p, drug))
+
+    # Growth rates
+    r_vec <- rep(r, M)
+
+    # Beta (volatility) for each ploidy
+    if (is.null(beta_by_ploidy)) {
+        beta_vec <- rep(0.02, M)
+    } else {
+        beta_vec <- sapply(ploidies, function(p) beta_by_ploidy[[as.character(p)]])
+    }
+
+    # Get concentration function
+    C_func <- get_concentration_curve(drug)
+
+    # Time grid
+    times <- seq(T_span[1], T_span[2], by=dt)
+    N <- length(times)
+
+    # Initialize paths: (n_sims, M, N)
+    Tpaths <- array(0, dim=c(n_sims, M, N))
+    Tpaths[, , 1] <- matrix(rep(T0, each=n_sims), nrow=n_sims, ncol=M)
+
+    # Exponential Euler update
+    for (k in 1:(N-1)) {
+        t <- times[k]
+        dtk <- times[k+1] - t
+        sqrt_dtk <- sqrt(max(dtk, eps))
+
+        C <- C_func(t)
+        phi_vals <- sapply(phi_params, function(pp) phi_Hill(C, pp$EC50, pp$n, pp$Emax))
+
+        T_curr <- Tpaths[, , k]  # (n_sims, M)
+        Tsum <- rowSums(T_curr)  # (n_sims)
+
+        # Drift term: mu = r*(1 - Tsum/K) - phi
+        mu <- sweep(matrix(r_vec, nrow=n_sims, ncol=M, byrow=TRUE), 1, Tsum/(K + 1e-6), function(x,y) x*(1-y)) -
+              matrix(phi_vals, nrow=n_sims, ncol=M, byrow=TRUE)
+
+        # Diffusion term
+        Z <- matrix(rnorm(n_sims * M), nrow=n_sims, ncol=M)
+        dW <- matrix(beta_vec, nrow=n_sims, ncol=M, byrow=TRUE) * sqrt_dtk * Z
+        beta_eff_sq <- matrix(beta_vec^2, nrow=n_sims, ncol=M, byrow=TRUE)
+
+        # Exponential Euler step
+        expo <- (mu - 0.5 * beta_eff_sq) * dtk + dW
+        T_next <- T_curr * exp(expo)
+
+        Tpaths[, , k+1] <- T_next
+    }
+
+    return(list(times=times, ploidies=ploidies, Tpaths=Tpaths))
+}
+
+# Main forecasting function (simplified R version of ploidy_forcast)
+ploidy_forcast <- function(ploidy_cell_count, drug, T, R_BASE=0.4, K_CAP=6e10,
+                           beta_by_ploidy=NULL, DT=0.1, N_SIMS=1000) {
+
+    result <- simulate_sde(ploidy_cell_count, drug, T_span=c(0, T), dt=DT,
+                          r=R_BASE, K=K_CAP, n_sims=N_SIMS, beta_by_ploidy=beta_by_ploidy)
+
+    # Return ploidies, t_ode (approx as t_sde), T_mat_ode (mean trajectory), t_sde, Tpaths
+    mean_trajectory <- apply(result$Tpaths, c(2, 3), mean)  # (M, N)
+
+    return(list(
+        ploidies = result$ploidies,
+        t_ode = result$times,
+        T_mat_ode = mean_trajectory,
+        t_sde = result$times,
+        Tpaths = result$Tpaths
+    ))
+}
+
+# Node class for MCTS
+Node <- setRefClass("Node",
+  fields = list(
+    ploidy_status = "list",
+    cycle = "numeric",
+    parent = "ANY",
+    children = "list",
+    N = "numeric",
+    W = "numeric"
+  ),
+  methods = list(
+    initialize = function(ploidy_status_val, cycle_val, parent_val=NULL) {
+      ploidy_status <<- ploidy_status_val
+      cycle <<- cycle_val
+      parent <<- parent_val
+      children <<- list()
+      N <<- 0
+      W <<- 0.0
+    },
+    is_terminal = function(total_cycles, min_size, max_size) {
+      total <- sum(unlist(ploidy_status))
+      return(cycle >= total_cycles || total < min_size || total > max_size)
+    },
+    is_fully_expanded = function(drugs) {
+      return(length(children) == length(drugs))
+    }
+  )
+)
+
+# Simulate next state with uncertainty calculation (from sde_mcts_shiny_app.R)
+simulate_next_state_mcts <- function(ploidy_status, drug, d_switch, N_SIMS=1000) {
+    result <- ploidy_forcast(ploidy_status, drug, T=d_switch, N_SIMS=N_SIMS)
+
+    Tpaths <- result$Tpaths
+    ploidies <- result$ploidies
+
+    # Calculate final total burdens across all simulations
+    final_total_burdens <- rowSums(Tpaths[, , dim(Tpaths)[3]])
+
+    # Freedman-Diaconis Rule for Binning
+    n <- length(final_total_burdens)
+    if (n > 1) {
+        q75 <- quantile(final_total_burdens, 0.75)
+        q25 <- quantile(final_total_burdens, 0.25)
+        iqr <- q75 - q25
+
+        if (iqr > eps) {
+            bin_width <- 2 * iqr * (n ^ (-1/3))
+            data_range <- max(final_total_burdens) - min(final_total_burdens)
+            # Prevent integer overflow and ensure reasonable number of bins
+            num_bins <- min(as.integer(ceiling(data_range / (bin_width + eps))), 100)
+            num_bins <- max(num_bins, 1)
+        } else {
+            num_bins <- 1
+        }
+    } else {
+        num_bins <- 1
+    }
+
+    # Calculate Shannon Entropy with safe histogram
+    uncertainty_score <- 0.0
+    tryCatch({
+        # Create explicit breaks to avoid integer overflow
+        min_val <- min(final_total_burdens)
+        max_val <- max(final_total_burdens)
+
+        # Use explicit sequence of breaks instead of just specifying number
+        if (max_val > min_val) {
+            breaks <- seq(min_val, max_val, length.out = min(num_bins + 1, 101))
+            hist_result <- hist(final_total_burdens, breaks=breaks, plot=FALSE)
+            counts <- hist_result$counts
+
+            # Filter out zero counts
+            counts <- counts[counts > 0]
+
+            if (length(counts) > 0) {
+                probs <- counts / (sum(counts) + eps)
+                probs <- probs[probs > eps]
+
+                if (length(probs) > 0) {
+                    entropy <- -sum(probs * log(probs + eps))
+                    max_entropy <- log(length(counts) + eps)
+                    if (max_entropy > 1e-9) {
+                        uncertainty_score <- entropy / (max_entropy + eps)
+                    }
+                }
+            }
+        }
+    }, error = function(e) {
+        # If histogram fails, set uncertainty to 0
+        uncertainty_score <- 0.0
+    })
+    uncertainty_score <- min(max(uncertainty_score, 0.0), 1.0)  # Clamp to [0, 1]
+
+    # Calculate mean final ploidy distribution
+    final_per_ploidy <- Tpaths[, , dim(Tpaths)[3]]  # (n_sims, num_ploidies)
+    mean_sde_per_ploidy <- colMeans(final_per_ploidy)
+
+    # Mean trajectory over time
+    mean_trajectory <- apply(Tpaths, c(2, 3), mean)  # (num_ploidies, time_points)
+    y <- t(mean_trajectory[, -1])  # Transpose and skip first time point
+
+    # New status
+    new_status <- as.list(mean_sde_per_ploidy)
+    names(new_status) <- as.character(ploidies)
+
+    confidence <- 1 - uncertainty_score
+
+    return(list(new_status=new_status, y=y, confidence=confidence))
+}
+
+# Select best child using UCB1
+select_best_child_to_explore <- function(node, c) {
+    best_score <- -Inf
+    best_child <- NULL
+
+    for (drug in names(node$children)) {
+        child <- node$children[[drug]]
+        Q <- child$W / (child$N + 1e-6)
+        U <- c * sqrt(log(node$N + 1e-6) / (child$N + 1e-6))
+        score <- Q + U
+
+        if (score > best_score) {
+            best_score <- score
+            best_child <- child
+        }
+    }
+
+    return(best_child)
+}
+
+# Expand node by trying an untried drug
+expand_mcts <- function(node, drugs, d_switch) {
+    untried <- setdiff(drugs, names(node$children))
+    drug <- sample(untried, 1)
+
+    result <- simulate_next_state_mcts(node$ploidy_status, drug, d_switch)
+    new_ploidy <- result$new_status
+
+    child <- Node$new(new_ploidy, node$cycle + 1, node)
+    node$children[[drug]] <- child
+
+    return(child)
+}
+
+# Rollout simulation from a node
+rollout_mcts <- function(node, rollout_depth, drugs, d_switch, min_size, max_size,
+                        alpha=0.01, p_order=3, safe_size=1e10, beta=1.0) {
+    ploidy <- node$ploidy_status
+    confidence <- 1.0
+
+    # Initialize path_burdens with the starting burden
+    path_burdens <- c(sum(unlist(ploidy)))
+    confidences <- c(confidence)
+
+    for (step in 1:rollout_depth) {
+        total <- sum(unlist(ploidy))
+        if (total < min_size || total > max_size) {
+            break
+        }
+
+        drug <- sample(drugs, 1)
+        result <- simulate_next_state_mcts(ploidy, drug, d_switch)
+        ploidy <- result$new_status
+        confidence <- result$confidence
+
+        # Collect burden along the path
+        path_burdens <- c(path_burdens, sum(unlist(ploidy)))
+        confidences <- c(confidences, confidence)
+    }
+
+    # Calculate reward using ODE formula
+    reward <- 0
+    for (burden in path_burdens) {
+        rollout_confidence = confidences[which(path_burdens == burden)[1]]
+        reward <- reward - ( rollout_confidence * ( (burden / (max_size + eps)) - alpha * ((max(0, burden - safe_size) / (max_size - safe_size)) ^ p_order) ) )
+    }
+
+    reward <- reward / length(path_burdens)
+
+    # if extinction is achieved, give a bonus
+    if (tail(path_burdens, 1) < min_size) {
+        t_idx <- which(path_burdens < min_size)
+        steps_to_extinct <- t_idx[1] - 1
+        bonus <- beta * ((rollout_depth - steps_to_extinct) / max(1, rollout_depth))
+        reward <- reward + bonus
+    }
+
+    return(reward)
+}
+
+# Backpropagate reward up the tree
+backpropagate <- function(node, reward) {
+    current <- node
+    while (!is.null(current)) {
+        current$N <- current$N + 1
+        current$W <- current$W + reward
+        current <- current$parent
+    }
+}
+
+# Main MCTS function (from sde_mcts_shiny_app.R)
+run_mcts_new <- function(ploidy_status, cycle, drugs, d_switch, total_cycles, min_size, max_size,
+                     depth=30, num_rollouts=100, c=sqrt(2),
+                     alpha=0.01, p_order=3, safe_size=1e10, beta=1.0) {
+
+    # Initialize root node for current state
+    root <- Node$new(ploidy_status, cycle)
+
+    # Run MCTS rollouts
+    for (i in 1:num_rollouts) {
+        node <- root
+
+        # Selection
+        while (node$is_fully_expanded(drugs) && !node$is_terminal(total_cycles, min_size, max_size)) {
+            node <- select_best_child_to_explore(node, c)
+        }
+
+        # Expansion
+        if (!node$is_terminal(total_cycles, min_size, max_size)) {
+            child <- expand_mcts(node, drugs, d_switch)
+            reward <- rollout_mcts(child, depth, drugs, d_switch, min_size, max_size,
+                                 alpha, p_order, safe_size, beta)
+            backpropagate(child, reward)
+        } else {
+            reward <- rollout_mcts(node, 0, drugs, d_switch, min_size, max_size,
+                                 alpha, p_order, safe_size, beta)
+            backpropagate(node, reward)
+        }
+    }
+
+    # Pick best drug based on Q-value
+    get_q <- function(child) {
+        child$W / (child$N + eps)
+    }
+
+    best_drug <- NULL
+    best_q <- -Inf
+    for (drug in names(root$children)) {
+        q <- get_q(root$children[[drug]])
+        if (q > best_q) {
+            best_q <- q
+            best_drug <- drug
+        }
+    }
+
+    return(best_drug)
+}
 
 # ==============================================================================
-# ====================== Core Shiny App Code ===================================
+# ====================== Core Shiny App Code (ORIGINAL) ========================
 # ==============================================================================
 
 # ---- ODE model ----
@@ -321,7 +652,10 @@ parse_measurements <- function(txt) {
     if (is.null(res)) data.frame(percent=numeric(0), time=numeric(0)) else res
 }
 
-# ---- UI ----
+# ==============================================================================
+# ====================== UI (ORIGINAL) =========================================
+# ==============================================================================
+
 ui <- fluidPage(
     tags$head(tags$style(HTML("
     .container-fluid { max-width: 850px; }
@@ -334,8 +668,10 @@ ui <- fluidPage(
             textInput("fractions", "Ploidy composition fractions",
                       placeholder = "e.g. 0.6,0.3,0.1", value = "0.6,0.3,0.1"),
             numericInput("B0", "Initial tumor burden (cells)", value = 1e7, min = 1, step = 1e6),
-            textInput("drug", "Drug name", value = "gemcitabine"), # Default drug updated
-
+            # --- UPDATED: Drug name is now a dropdown menu ---
+            selectInput("drug", "Drug name",
+                        choices = c("gemcitabine", "bay1895344", "alisertib", "ispinesib", "none"),
+                        selected = "gemcitabine"),
             numericInput("cycleDays", "Cycle Length (days)", value = 28, min = 1, max = 100, step = 1),
 
             actionButton("runCycle", "Run Next Cycle", class = "btn-primary"),
@@ -369,7 +705,10 @@ ui <- fluidPage(
     )
 )
 
-# ---- Server ----
+# ==============================================================================
+# ====================== Server (WITH NEW MCTS) ================================
+# ==============================================================================
+
 server <- function(input, output, session) {
     all_cycles <- reactiveVal(list())
     last_B <- reactiveVal(NULL)
@@ -377,304 +716,147 @@ server <- function(input, output, session) {
     prediction_result <- reactiveVal(NULL)
 
     observeEvent(input$runMCTS, {
-        # --- 1. Get Current State from App ---
-        # If cycles exist, use last state. If not, use input B0 and fractions.
         cycles <- all_cycles()
         if (length(cycles) > 0) {
             last_df <- cycles[[length(cycles)]]$df
             b_cols <- grep("^B[0-9]+$", names(last_df), value = TRUE)
             initial_counts <- unlist(tail(last_df, 1)[, b_cols])
-            current_B <- sum(initial_counts)
         } else {
-            fr <- parse_fractions(input$fractions)
-            if (is.null(fr)) return(NULL)
-            current_B <- input$B0
-            initial_counts <- fr * current_B
+            fr <- parse_fractions(input$fractions); if (is.null(fr)) return(NULL)
+            initial_counts <- fr * input$B0
             names(initial_counts) <- paste0("B", seq_along(fr))
         }
 
-        # --- 2. MCTS Constants & Parameters ---
+        # Convert initial_counts to ploidy_status format for new MCTS
+        # Assuming B1 = 2n, B2 = 3n, B3 = 4n
+        ploidy_labels <- seq(2, length.out=length(initial_counts))
+        ploidy_status <- as.list(as.numeric(initial_counts))
+        names(ploidy_status) <- as.character(ploidy_labels)
+
+        # Parameters for new MCTS
         drugs_mcts <- c("gemcitabine", "bay1895344", "alisertib", "ispinesib", "none")
-        # d_switch <- 7  # days per treatment in MCTS
-        rollout_depth <- 30
-        num_rollouts <- 100 # Faster for debugging
-        min_size <- 0
+        total_cycles_plan <- 5
+        num_rollouts <- 100  # Reduced from 1000 for faster execution
+        rollout_depth <- 10
+        min_size <- 1e5
         max_size <- 2e10
         c_param <- sqrt(2)
+        d_switch <- 7  # Drug switch time in days
+
+        # Reward function parameters (matching ODE app)
+        alpha <- 0.01
+        p_order <- 3
+        safe_size <- 1e10
+        beta <- 1.0
 
         predicted_sequence <- c()
-        temp_state <- initial_counts
 
-        # --- 3. Helper Functions for MCTS ---
-
-        # Function to simulate one step (wraps run_one_cycle)
-        simulate_next_state <- function(state_counts, drug_name, days) {
-            # state_counts: named vector of absolute cell counts per ploidy
-            # returns: new named vector of counts
-
-            total_b <- sum(state_counts)
-            if (total_b <= 0) return(state_counts)
-
-            fracs <- state_counts / total_b
-
-            # Using current k_multiplier from the app context
-            k_mult <- current_k_mult()
-
-            # Run simulation
-            # Note: dt is kept crude (0.5) for speed during MCTS
-            res <- run_one_cycle(ploidy_fracs = fracs,
-                                 B0 = total_b,
-                                 drug_name = drug_name,
-                                 days = days,
-                                 dt = 0.5,
-                                 k_multiplier_base = k_mult)
-
-            # Extract final state
-            b_cols <- grep("^B[0-9]+$", names(res), value = TRUE)
-            final_counts <- unlist(tail(res, 1)[, b_cols])
-            return(final_counts)
-        }
-
-        # Node structure using environments (pass-by-reference simulation in R)
-        new_node <- function(state, cycle, parent=NULL) {
-            e <- new.env()
-            e$state <- state
-            e$cycle <- cycle
-            e$parent <- parent
-            e$children <- list()
-            e$N <- 0
-            e$W <- 0
-            return(e)
-        }
-
-        is_terminal <- function(node) {
-            total <- sum(node$state)
-            # Hard limit on lookahead depth is implicit in rollout logic,
-            # but we can check if tumor is extinct or exploded here too.
-            if (total < min_size || total > max_size) return(TRUE)
-            return(FALSE)
-        }
-
-        is_fully_expanded <- function(node) {
-            return(length(node$children) == length(drugs_mcts))
-        }
-
-        select_best_child <- function(node, c_val) {
-            best_score <- -Inf
-            best_child <- NULL
-
-            for (child in node$children) {
-                if (child$N == 0) {
-                    score <- Inf
-                } else {
-                    Q <- child$W / child$N
-                    U <- c_val * sqrt(log(node$N + 1) / child$N)
-                    score <- Q + U
-                }
-
-                if (score > best_score) {
-                    best_score <- score
-                    best_child <- child
-                }
-            }
-            return(best_child)
-        }
-
-        expand_node <- function(node) {
-            existing_drugs <- names(node$children)
-            untried <- setdiff(drugs_mcts, existing_drugs)
-            if (length(untried) == 0) return(NULL)
-
-            drug <- sample(untried, 1)
-            new_state <- simulate_next_state(node$state, drug, cycle_lengths[[drug]])
-
-            child <- new_node(new_state, node$cycle + 1, parent=node)
-            node$children[[drug]] <- child
-            return(child)
-        }
-
-        rollout <- function(node, depth) {
-            current_state <- node$state
-            extinct <- FALSE
-            maxed_out <- FALSE
-            extinction_step <- 0
-
-            for (step in 1:depth) {
-                total <- sum(current_state)
-                if (total < min_size) {
-                    extinct <- TRUE
-                    extinction_step <- step
-                    break
-                } else if (total > max_size) {
-                    maxed_out <- TRUE
-                    break
-                }
-
-                # Random move
-                drug <- sample(drugs_mcts, 1)
-                current_state <- simulate_next_state(current_state, drug, cycle_lengths[[drug]])
-            }
-
-            final_burden <- sum(current_state)
-
-            if (extinct) {
-                # Reward fast extinction
-                extinction_boost <- (depth - extinction_step) / depth
-                reward <- 1.0 * extinction_boost
-            } else if (maxed_out) {
-                # Penalty but slight survival bonus logic
-                reward <- 0.01 * step
-            } else {
-                reward <- 1.0 - final_burden / 2e10
-            }
-            return(reward)
-        }
-
-        backpropagate <- function(node, reward) {
-            curr <- node
-            while (!is.null(curr)) {
-                curr$N <- curr$N + 1
-                curr$W <- curr$W + reward
-                curr <- curr$parent
-            }
-        }
-
-        # --- 4. Main MCTS Loop ---
         withProgress(message = 'Calculating Optimal Sequence...', value = 0, {
+            for (step in 1:total_cycles_plan) {
+                incProgress(1/total_cycles_plan, detail = paste("Simulating Cycle", step))
 
-            for (step in 1:5) {
-                incProgress(1/5, detail = paste("Simulating Cycle", step))
-
-                # Check if tumor is already extinct in simulation
-                if (sum(temp_state) < min_size) {
+                if (sum(unlist(ploidy_status)) < min_size) {
                     predicted_sequence <- c(predicted_sequence, "Extinct")
                     next
                 }
 
-                # Reset MCTS Tree for current state
-                root <- new_node(temp_state, 0)
+                # Run new MCTS
+                best_drug <- run_mcts_new(ploidy_status, step-1, drugs_mcts, d_switch,
+                                         total_cycles_plan, min_size, max_size,
+                                         rollout_depth, num_rollouts, c_param,
+                                         alpha, p_order, safe_size, beta)
 
-                for (i in 1:num_rollouts) {
-                    node <- root
-                    # Selection
-                    while (is_fully_expanded(node) && !is_terminal(node)) {
-                        node <- select_best_child(node, c_param)
-                    }
-                    # Expansion
-                    if (!is_terminal(node)) {
-                        node <- expand_node(node)
-                    }
-                    # Simulation
-                    reward <- rollout(node, rollout_depth)
-                    # Backpropagation
-                    backpropagate(node, reward)
-                }
-
-                # Select Best Drug for this step
-                best_val <- -Inf
-                best_drug <- "none"
-                for (d_name in names(root$children)) {
-                    child <- root$children[[d_name]]
-                    score <- child$W / (child$N + 1e-6)
-                    if (score > best_val) {
-                        best_val <- score
-                        best_drug <- d_name
-                    }
-                }
-
-                # 1. Add to sequence
                 predicted_sequence <- c(predicted_sequence, best_drug)
 
-                # 2. Update temp_state for the next cycle prediction
-                # (Simulates the effect of the chosen drug)
-                temp_state <- simulate_next_state(temp_state, best_drug, cycle_lengths[[best_drug]])
+                # Update state with best drug
+                result <- simulate_next_state_mcts(ploidy_status, best_drug, d_switch)
+                ploidy_status <- result$new_status
             }
 
             prediction_result(predicted_sequence)
         })
     })
+
     output$mcts_prediction <- renderUI({
-        res <- prediction_result()
-        if (is.null(res)) return(NULL)
+        pred <- prediction_result()
+        if (is.null(pred)) return(NULL)
 
-        # Format the sequence as a string
-        sequence_str <- paste(res, collapse = ", ")
-
-        tagList(
-            tags$div(style = "color: #D11; font-weight: bold; margin-top: 15px; border-top: 1px solid #ddd;",
-                     "Optimal Drug Sequence (Next 5 Cycles):"),
-            tags$div(style = "font-family: monospace; background: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 5px;",
-                     sequence_str),
-            tags$p(style = "font-size: 11px; color: #666; margin-top: 5px;",
-                   "MCTS projected optimal strategy based on current ploidy sensitivity.")
+        div(
+            style = "background-color: #e8f4f8; padding: 10px; margin-top: 10px; border-radius: 5px;",
+            tags$strong("MCTS Predicted Sequence:"),
+            tags$ul(
+                lapply(seq_along(pred), function(i) {
+                    tags$li(paste("Cycle", i, ":", pred[i]))
+                })
+            )
         )
     })
 
     observeEvent(input$runCycle, {
         fr <- parse_fractions(input$fractions)
-        validate(
-            need(!is.null(fr), "Please enter valid ploidy fractions (e.g., 0.6,0.3,0.1)."),
-            need(input$B0 > 0, "Initial tumor burden must be > 0."),
-            need(input$cycleDays > 0, "Cycle length must be > 0.")
-        )
-
-        B_start <- if (is.null(last_B())) input$B0 else last_B()
-
-        k_mult_base <- current_k_mult()
-
-        ode_df <- run_one_cycle(ploidy_fracs = fr,
-                                B0 = B_start,
-                                drug_name = input$drug,
-                                days = input$cycleDays,
-                                k_multiplier_base = k_mult_base)
-
-        cycles <- all_cycles()
-        idx <- length(cycles) + 1
-
-        if (idx > 1) {
-            last_time <- max(cycles[[idx - 1]]$df$cum_time)
-            ode_df$cum_time <- ode_df$time + last_time
-        } else {
-            ode_df$cum_time <- ode_df$time
+        if (is.null(fr)) {
+            showNotification("Invalid ploidy fractions.", type = "error")
+            return(NULL)
         }
 
-        meas_df <- data.frame(percent = numeric(0), time = numeric(0),
-                              B = numeric(0), cum_time = numeric(0))
+        B_start <- if (!is.null(last_B())) last_B() else input$B0
 
-        cycles[[idx]] <- list(df = ode_df, meas = meas_df,
-                              r_vec = attr(ode_df, "r_vec"),
-                              K = attr(ode_df, "K"),
-                              drug  = attr(ode_df, "drug"),
-                              phi_params_list = attr(ode_df, "phi_params_list"),
-                              C_func = attr(ode_df, "C_func"),
-                              k_multiplier_base = k_mult_base,
-                              df_fitted = NULL,
-                              k_multiplier_fitted = NULL)
+        drug_chosen <- input$drug
+        cycle_days <- input$cycleDays
+        K_val <- 1e9
+
+        df <- run_one_cycle(ploidy_fracs = fr,
+                           B0 = B_start,
+                           drug_name = drug_chosen,
+                           K = K_val,
+                           days = cycle_days,
+                           dt = 0.1,
+                           k_multiplier_base = current_k_mult())
+
+        df_fitted_out <- NULL
+        k_mult_fitted <- NULL
+
+        cum_time_start <- 0
+        cycles_so_far <- all_cycles()
+        if (length(cycles_so_far) > 0) {
+            last_cycle <- cycles_so_far[[length(cycles_so_far)]]
+            cum_time_start <- max(last_cycle$df$cum_time)
+        }
+        df$cum_time <- df$time + cum_time_start
+
+        cur_cycle <- list(
+            df = df,
+            meas = data.frame(time=numeric(0), B=numeric(0), cum_time=numeric(0)),
+            drug = drug_chosen,
+            r_vec = attr(df, "r_vec"),
+            K = K_val,
+            phi_params_list = attr(df, "phi_params_list"),
+            C_func = attr(df, "C_func"),
+            k_multiplier_base = attr(df, "k_multiplier_base"),
+            k_multiplier_fitted = k_mult_fitted,
+            df_fitted = df_fitted_out
+        )
+
+        cycles <- c(all_cycles(), list(cur_cycle))
         all_cycles(cycles)
 
-        last_B(tail(ode_df$B_total, 1))
+        last_B(tail(df$B_total, 1))
     })
 
     observeEvent(input$addMeas, {
-        meas <- parse_measurements(input$measurements)
-        validate(need(nrow(meas) > 0, "Please enter valid measurement pairs (%burden time)."))
-
         cycles <- all_cycles()
-        validate(need(length(cycles) > 0, "Run a cycle before adding measurements."))
+        validate(need(length(cycles) > 0, "Run a cycle first."))
 
         cur_idx <- length(cycles)
         cur <- cycles[[cur_idx]]
 
-        B_start <- cur$df$B_total[1]
-        meas$B <- (meas$percent / 100) * B_start
+        meas_raw <- parse_measurements(input$measurements)
+        if (is.null(meas_raw) || nrow(meas_raw) == 0) return(NULL)
 
-        base_cum_t0 <- min(cur$df$cum_time)
-        meas$cum_time <- meas$time + base_cum_t0
-        meas <- subset(meas, meas$time >= 0 & meas$time <= max(cur$df$time))
+        meas_raw$B <- (meas_raw$percent / 100) * cur$df$B_total[1]
+        meas_raw$cum_time <- meas_raw$time + min(cur$df$cum_time)
 
-        cur$meas <- meas
-        cur$df_fitted <- NULL
-        cur$k_multiplier_fitted <- NULL
+        cur$meas <- rbind(cur$meas, meas_raw[, c("time","B","cum_time")])
 
         cycles[[cur_idx]] <- cur
         all_cycles(cycles)
